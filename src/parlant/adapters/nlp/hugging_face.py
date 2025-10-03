@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from collections.abc import Mapping
 import os
 from pathlib import Path
@@ -42,7 +43,8 @@ def _model_temp_dir() -> str:
     return str(Path(gettempdir()) / "parlant_data" / "hf_models")
 
 
-def _create_tokenizer(model_name: str) -> AutoTokenizer:
+def _create_tokenizer_sync(model_name: str) -> AutoTokenizer:
+    """Synchronous tokenizer creation - should only be called in thread pool."""
     if model_name in _TOKENIZER_MODELS:
         return _TOKENIZER_MODELS[model_name]
 
@@ -55,6 +57,11 @@ def _create_tokenizer(model_name: str) -> AutoTokenizer:
     _TOKENIZER_MODELS[model_name] = tokenizer
 
     return tokenizer
+
+
+async def _create_tokenizer(model_name: str) -> AutoTokenizer:
+    """Async-safe tokenizer creation using thread pool to avoid blocking."""
+    return await asyncio.to_thread(_create_tokenizer_sync, model_name)
 
 
 def _get_device() -> torch.device:
@@ -73,7 +80,8 @@ def _get_device() -> torch.device:
     return _DEVICE
 
 
-def _create_auto_model(model_name: str) -> AutoModel:
+def _create_auto_model_sync(model_name: str) -> AutoModel:
+    """Synchronous model creation - should only be called in thread pool."""
     if model_name in _AUTO_MODELS:
         return _AUTO_MODELS[model_name]
 
@@ -93,13 +101,27 @@ def _create_auto_model(model_name: str) -> AutoModel:
     return model
 
 
+async def _create_auto_model(model_name: str) -> AutoModel:
+    """Async-safe model creation using thread pool to avoid blocking."""
+    return await asyncio.to_thread(_create_auto_model_sync, model_name)
+
+
 class HuggingFaceEstimatingTokenizer(EstimatingTokenizer):
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self._tokenizer = _create_tokenizer(model_name)
+        self._tokenizer: AutoTokenizer | None = None
+        self._tokenizer_initialized = False
+
+    async def _ensure_tokenizer(self) -> None:
+        """Ensure tokenizer is initialized asynchronously."""
+        if not self._tokenizer_initialized:
+            self._tokenizer = await _create_tokenizer(self.model_name)
+            self._tokenizer_initialized = True
 
     @override
     async def estimate_token_count(self, prompt: str) -> int:
+        await self._ensure_tokenizer()
+        assert self._tokenizer is not None
         tokens = self._tokenizer.tokenize(prompt)
         return len(tokens)
 
@@ -107,8 +129,15 @@ class HuggingFaceEstimatingTokenizer(EstimatingTokenizer):
 class HuggingFaceEmbedder(Embedder):
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
-        self._model = _create_auto_model(model_name)
+        self._model: AutoModel | None = None
+        self._model_initialized = False
         self._tokenizer = HuggingFaceEstimatingTokenizer(model_name=model_name)
+
+    async def _ensure_model(self) -> None:
+        """Ensure model is initialized asynchronously."""
+        if not self._model_initialized:
+            self._model = await _create_auto_model(self.model_name)
+            self._model_initialized = True
 
     @property
     @override
@@ -124,6 +153,12 @@ class HuggingFaceEmbedder(Embedder):
     @override
     def tokenizer(self) -> HuggingFaceEstimatingTokenizer:
         return self._tokenizer
+
+    @property
+    @override
+    def dimensions(self) -> int:
+        # Default embedding dimension for most BERT-style models
+        return 768
 
     @policy(
         [
@@ -144,6 +179,13 @@ class HuggingFaceEmbedder(Embedder):
         texts: list[str],
         hints: Mapping[str, Any] = {},
     ) -> EmbeddingResult:
+        # Ensure both model and tokenizer are initialized
+        await self._ensure_model()
+        await self._tokenizer._ensure_tokenizer()
+
+        assert self._model is not None
+        assert self._tokenizer._tokenizer is not None
+
         tokenized_texts = self._tokenizer._tokenizer.batch_encode_plus(
             texts, padding=True, truncation=True, return_tensors="pt"
         )
